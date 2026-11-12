@@ -26,6 +26,45 @@ int as_should_beep(unsigned secs_left) {
     return secs_left <= 5 || secs_left % 10 == 0;
 }
 
+static const wchar_t *const power_names[] = { L"shutdown", L"restart", L"sleep", L"hibernate" };
+
+static int same_word(const wchar_t *a, const wchar_t *b) { /* ASCII, ignores case */
+    for (; *a && *b; a++, b++) {
+        wchar_t x = (*a >= L'A' && *a <= L'Z') ? (wchar_t)(*a + 32) : *a;
+        wchar_t y = (*b >= L'A' && *b <= L'Z') ? (wchar_t)(*b + 32) : *b;
+        if (x != y)
+            return 0;
+    }
+    return *a == *b;
+}
+
+as_power as_parse_power(const wchar_t *s) {
+    int i;
+    if (!s)
+        return AS_POWER_SHUTDOWN;
+    for (i = 0; i < 4; i++)
+        if (same_word(s, power_names[i]))
+            return (as_power)i;
+    return AS_POWER_SHUTDOWN;
+}
+
+const wchar_t *as_power_name(as_power p) {
+    return (unsigned)p < 4u ? power_names[p] : power_names[0];
+}
+
+const wchar_t *as_default_message(as_power p) {
+    switch (p) {
+    case AS_POWER_RESTART:   return L"This PC will restart. Move the mouse or press any key to cancel.";
+    case AS_POWER_SLEEP:     return L"This PC will go to sleep. Move the mouse or press any key to cancel.";
+    case AS_POWER_HIBERNATE: return L"This PC will hibernate. Move the mouse or press any key to cancel.";
+    default:                 return L"This PC will shut down. Move the mouse or press any key to cancel.";
+    }
+}
+
+int as_in_range_or(int v, int lo, int hi, int def) {
+    return (v >= lo && v <= hi) ? v : def;
+}
+
 int as_parse_minutes(const wchar_t *s, unsigned *out) {
     unsigned v = 0;
     if (!s || !*s)

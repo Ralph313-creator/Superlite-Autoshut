@@ -85,7 +85,50 @@ static void test_parse_minutes(void) {
     CHECK(!as_parse_minutes(NULL, &m));
 }
 
+static void test_parse_power_action(void) {
+    CHECK(as_parse_power(L"shutdown") == AS_POWER_SHUTDOWN);
+    CHECK(as_parse_power(L"restart") == AS_POWER_RESTART);
+    CHECK(as_parse_power(L"Restart") == AS_POWER_RESTART);
+    CHECK(as_parse_power(L"SLEEP") == AS_POWER_SLEEP);
+    CHECK(as_parse_power(L"hibernate") == AS_POWER_HIBERNATE);
+}
+
+static void test_unknown_power_action_means_shutdown(void) {
+    CHECK(as_parse_power(L"") == AS_POWER_SHUTDOWN);
+    CHECK(as_parse_power(L"reboot please") == AS_POWER_SHUTDOWN);
+    CHECK(as_parse_power(L"sleepy") == AS_POWER_SHUTDOWN);
+    CHECK(as_parse_power(NULL) == AS_POWER_SHUTDOWN);
+}
+
+static void test_power_names_round_trip(void) {
+    CHECK(as_parse_power(as_power_name(AS_POWER_SHUTDOWN)) == AS_POWER_SHUTDOWN);
+    CHECK(as_parse_power(as_power_name(AS_POWER_RESTART)) == AS_POWER_RESTART);
+    CHECK(as_parse_power(as_power_name(AS_POWER_SLEEP)) == AS_POWER_SLEEP);
+    CHECK(as_parse_power(as_power_name(AS_POWER_HIBERNATE)) == AS_POWER_HIBERNATE);
+}
+
+static void test_default_message_names_the_action(void) {
+    CHECK(wcsstr(as_default_message(AS_POWER_SHUTDOWN), L"shut down") != NULL);
+    CHECK(wcsstr(as_default_message(AS_POWER_RESTART), L"restart") != NULL);
+    CHECK(wcsstr(as_default_message(AS_POWER_SLEEP), L"sleep") != NULL);
+    CHECK(wcsstr(as_default_message(AS_POWER_HIBERNATE), L"hibernate") != NULL);
+}
+
+static void test_setting_in_range_or_default(void) {
+    CHECK(as_in_range_or(15, 1, 1440, 10) == 15);
+    CHECK(as_in_range_or(1, 1, 1440, 10) == 1);
+    CHECK(as_in_range_or(1440, 1, 1440, 10) == 1440);
+    CHECK(as_in_range_or(0, 1, 1440, 10) == 10);
+    CHECK(as_in_range_or(-3, 1, 1440, 10) == 10);
+    CHECK(as_in_range_or(5000, 1, 1440, 10) == 10);
+}
+
 int main(void) {
+    test_parse_power_action();
+    test_unknown_power_action_means_shutdown();
+    test_power_names_round_trip();
+    test_default_message_names_the_action();
+    test_setting_in_range_or_default();
     test_active_before_idle_time();
     test_input_cancels_a_running_warning();
     test_warns_when_idle_time_reached();

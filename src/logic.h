@@ -31,6 +31,25 @@ int as_should_beep(unsigned secs_left);
 /* Parse a minutes argument ("10"). Returns 1 and sets *out for 1..1440. */
 int as_parse_minutes(const wchar_t *s, unsigned *out);
 
+/* What happens when the countdown ends (config.ini Action=). */
+typedef enum {
+    AS_POWER_SHUTDOWN = 0,
+    AS_POWER_RESTART = 1,
+    AS_POWER_SLEEP = 2,
+    AS_POWER_HIBERNATE = 3
+} as_power;
+
+/* "shutdown" / "restart" / "sleep" / "hibernate", any case. Anything else
+   is shutdown, so a typo never leaves the PC running. */
+as_power as_parse_power(const wchar_t *s);
+const wchar_t *as_power_name(as_power p);
+
+/* Warning text used when config.ini has no Message=. */
+const wchar_t *as_default_message(as_power p);
+
+/* v if lo <= v <= hi, else def (bad or missing config values). */
+int as_in_range_or(int v, int lo, int hi, int def);
+
 #define AS_MIN_MINUTES 1u
 #define AS_MAX_MINUTES 1440u
 #define AS_DEFAULT_MINUTES 10u

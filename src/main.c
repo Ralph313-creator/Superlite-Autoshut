@@ -4,30 +4,37 @@
  *
  *   SuperliteAutoshut.exe install [minutes]   install + start the service (admin)
  *   SuperliteAutoshut.exe set <minutes>       change the idle time (admin)
- *   SuperliteAutoshut.exe status              show what is installed
+ *   SuperliteAutoshut.exe status              show the current settings
  *   SuperliteAutoshut.exe uninstall           remove everything (admin)
+ *
+ * Settings live in config.ini next to the installed exe. The service waits
+ * on a Windows change notification for that folder, so a saved edit applies
+ * at once without polling.
  *
  * Internal modes: "service" (run by Windows) and "helper" (started by the
  * service on the console desktop, as SYSTEM so customers can't end it).
  * The helper reads the session's last-input time, shows the countdown, and
- * exits with AS_EXIT_SHUTDOWN when it reaches 0; the service then shuts down.
+ * exits with AS_EXIT_POWER when it reaches 0; the service then does the
+ * configured action (shutdown / restart / sleep / hibernate).
  *
- * Build with /DAS_TEST_BUILD for a copy that never shuts down: it writes
+ * Build with /DAS_TEST_BUILD for a copy that never turns the PC off: it writes
  * what it would do to %ProgramData%\Superlite Autoshut\test.log instead.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <wtsapi32.h>
 #include <shellapi.h>
+#include <powrprof.h>
 #include <intrin.h>
 #include "logic.h"
 
 #define SVC_NAME     L"SuperliteAutoshut"
-#define REG_KEY      L"SOFTWARE\\Superlite Autoshut"
+#define OLD_REG_KEY  L"SOFTWARE\\Superlite Autoshut" /* 1.0.0 kept IdleMinutes here */
 #define EXE_NAME     L"SuperliteAutoshut.exe"
+#define INI_NAME     L"config.ini"
 #define INSTALL_DIR  L"Superlite Autoshut"
-#define AS_EXIT_SHUTDOWN 0x5D0Fu
-#define AS_VERSION   L"1.0.0"
+#define AS_EXIT_POWER 0x5D0Fu
+#define AS_VERSION   L"1.1.0"
+#define DEFAULT_TITLE L"No activity detected"
 
 #ifdef AS_TEST_BUILD
 #define SVC_DISPLAY L"Superlite Autoshut (TEST - never shuts down)"
@@ -50,7 +57,7 @@ static void out(const wchar_t *s) {
     if (GetConsoleMode(h, &mode)) {
         WriteConsoleW(h, s, (DWORD)lstrlenW(s), &n, NULL);
     } else { /* redirected: write UTF-8 */
-        char buf[1024];
+        char buf[2048];
         int len = WideCharToMultiByte(CP_UTF8, 0, s, -1, buf, sizeof buf, NULL, NULL);
         if (len > 1)
             WriteFile(h, buf, (DWORD)(len - 1), &n, NULL);
@@ -66,47 +73,27 @@ static void outf(const wchar_t *fmt, ...) {
     out(buf);
 }
 
-/* ---- paths, registry, test log ------------------------------------------ */
-static void install_dir(wchar_t *buf, DWORD cap) {
-    DWORD n = GetEnvironmentVariableW(L"ProgramW6432", buf, cap);
-    if (!n || n >= cap)
-        n = GetEnvironmentVariableW(L"ProgramFiles", buf, cap);
-    if (!n || n >= cap)
+/* ---- paths ------------------------------------------------------------ */
+static void install_dir(wchar_t *buf) {
+    DWORD n = GetEnvironmentVariableW(L"ProgramW6432", buf, MAX_PATH);
+    if (!n || n >= MAX_PATH)
+        n = GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH);
+    if (!n || n >= MAX_PATH)
         lstrcpyW(buf, L"C:\\Program Files");
     lstrcatW(buf, L"\\" INSTALL_DIR);
 }
 
-static void install_exe(wchar_t *buf, DWORD cap) {
-    install_dir(buf, cap);
-    lstrcatW(buf, L"\\" EXE_NAME);
+static void install_file(wchar_t *buf, const wchar_t *name) {
+    install_dir(buf);
+    lstrcatW(buf, L"\\");
+    lstrcatW(buf, name);
 }
 
-static DWORD reg_get(const wchar_t *name, DWORD def) {
-    DWORD v = 0, sz = sizeof v;
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, REG_KEY, name, RRF_RT_REG_DWORD, NULL, &v, &sz) == ERROR_SUCCESS)
-        return v;
-    return def;
-}
-
-static int reg_set(const wchar_t *name, DWORD v) {
-    HKEY k;
-    LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, REG_KEY, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &k, NULL);
-    if (r != ERROR_SUCCESS)
-        return 0;
-    r = RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof v);
-    RegCloseKey(k);
-    return r == ERROR_SUCCESS;
-}
-
-static unsigned saved_minutes(void) {
-    DWORD m = reg_get(L"IdleMinutes", AS_DEFAULT_MINUTES);
-    return (m >= AS_MIN_MINUTES && m <= AS_MAX_MINUTES) ? m : AS_DEFAULT_MINUTES;
-}
-
+/* ---- test log (test build only) ------------------------------------------ */
 #ifdef AS_TEST_BUILD
 static void logw(const wchar_t *fmt, ...) {
-    wchar_t path[MAX_PATH], line[512];
-    char utf8[1024];
+    wchar_t path[MAX_PATH], line[1024];
+    char utf8[2048];
     SYSTEMTIME t;
     va_list ap;
     int n;
@@ -138,20 +125,135 @@ static void logw(const wchar_t *fmt, ...) {
 #endif
 
 /* ========================================================================
+ * config.ini
+ * ===================================================================== */
+typedef struct {
+    unsigned idle_minutes;
+    unsigned warn_seconds;
+    as_power power;
+    int beep;
+    int enabled;
+    wchar_t title[128];
+    wchar_t message[512];
+    unsigned test_idle_seconds; /* test build only: [Test] IdleSeconds */
+} config;
+
+static int ini_int(const wchar_t *path, const wchar_t *sec, const wchar_t *key, int lo, int hi, int def) {
+    return as_in_range_or((int)GetPrivateProfileIntW(sec, key, def, path), lo, hi, def);
+}
+
+/* "\n" typed in the ini becomes a line break on the warning. */
+static void unescape_newlines(wchar_t *s) {
+    wchar_t *w = s;
+    for (; *s; s++) {
+        if (s[0] == L'\\' && (s[1] == L'n' || s[1] == L'N')) {
+            *w++ = L'\n';
+            s++;
+        } else {
+            *w++ = *s;
+        }
+    }
+    *w = 0;
+}
+
+static void config_load(config *c) {
+    wchar_t path[MAX_PATH], buf[32];
+    install_file(path, INI_NAME);
+    c->idle_minutes = (unsigned)ini_int(path, L"Settings", L"IdleMinutes", AS_MIN_MINUTES, AS_MAX_MINUTES, AS_DEFAULT_MINUTES);
+    c->warn_seconds = (unsigned)ini_int(path, L"Settings", L"WarnSeconds", 10, 600, AS_DEFAULT_WARN_SECONDS);
+    GetPrivateProfileStringW(L"Settings", L"Action", L"shutdown", buf, 32, path);
+    c->power = as_parse_power(buf);
+    c->beep = ini_int(path, L"Settings", L"Beep", 0, 1, 1);
+    c->enabled = ini_int(path, L"Settings", L"Enabled", 0, 1, 1);
+    GetPrivateProfileStringW(L"Warning", L"Title", L"", c->title, 128, path);
+    if (!c->title[0])
+        lstrcpyW(c->title, DEFAULT_TITLE);
+    GetPrivateProfileStringW(L"Warning", L"Message", L"", c->message, 512, path);
+    if (!c->message[0])
+        lstrcpynW(c->message, as_default_message(c->power), 512);
+    unescape_newlines(c->title);
+    unescape_newlines(c->message);
+    c->test_idle_seconds = (unsigned)ini_int(path, L"Test", L"IdleSeconds", 5, 86400, 0);
+}
+
+/* Old 1.0.0 setting, used once when upgrading. */
+static unsigned old_registry_minutes(void) {
+    DWORD v = 0, sz = sizeof v;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, OLD_REG_KEY, L"IdleMinutes", RRF_RT_REG_DWORD, NULL, &v, &sz) == ERROR_SUCCESS &&
+        v >= AS_MIN_MINUTES && v <= AS_MAX_MINUTES)
+        return v;
+    return AS_DEFAULT_MINUTES;
+}
+
+/* Write a fresh, commented config.ini (UTF-16 so any language works). */
+static int config_write_default(unsigned minutes) {
+    static const wchar_t head[] =
+        L"; Superlite Autoshut settings.\r\n"
+        L"; Edit as administrator (this folder is in Program Files) and save:\r\n"
+        L"; the new settings apply by themselves, no restart needed.\r\n"
+        L"\r\n"
+        L"[Settings]\r\n"
+        L"; Minutes with no keyboard or mouse use before the warning shows (1-1440)\r\n";
+    static const wchar_t tail[] =
+        L"; How long the warning counts down, in seconds (10-600)\r\n"
+        L"WarnSeconds=60\r\n"
+        L"; What happens when the countdown ends: shutdown, restart, sleep or hibernate\r\n"
+        L"Action=shutdown\r\n"
+        L"; Beep during the countdown: 1 = on, 0 = off\r\n"
+        L"Beep=1\r\n"
+        L"; 1 = on, 0 = paused (stays installed but never acts)\r\n"
+        L"Enabled=1\r\n"
+        L"\r\n"
+        L"[Warning]\r\n"
+        L"; Text on the warning screen. Write \\n for a new line.\r\n"
+        L"; Leave Message empty to use the default text for the Action.\r\n"
+        L"Title=No activity detected\r\n"
+        L"Message=\r\n";
+    wchar_t path[MAX_PATH], line[64];
+    WORD bom = 0xFEFF;
+    DWORD w;
+    BOOL ok;
+    HANDLE f;
+    install_file(path, INI_NAME);
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    wsprintfW(line, L"IdleMinutes=%u\r\n", minutes);
+    ok = WriteFile(f, &bom, sizeof bom, &w, NULL) &&
+         WriteFile(f, head, sizeof head - sizeof(wchar_t), &w, NULL) &&
+         WriteFile(f, line, (DWORD)lstrlenW(line) * sizeof(wchar_t), &w, NULL) &&
+         WriteFile(f, tail, sizeof tail - sizeof(wchar_t), &w, NULL);
+    CloseHandle(f);
+    return ok;
+}
+
+static int config_set_minutes(unsigned minutes) {
+    wchar_t path[MAX_PATH], v[16];
+    install_file(path, INI_NAME);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
+        return config_write_default(minutes);
+    wsprintfW(v, L"%u", minutes);
+    return WritePrivateProfileStringW(L"Settings", L"IdleMinutes", v, path);
+}
+
+/* ========================================================================
  * Helper: lives on the console desktop, watches for input, shows warning
  * ===================================================================== */
+static config g_conf;
 static as_config g_cfg;
-static HWND g_wnd;
 static unsigned g_secs;
+static DWORD g_shown_at; /* tick count when the warning appeared */
 static HFONT g_font_title, g_font_num, g_font_hint;
-static int g_dpi = 96;
+static int g_dpi = 96, g_msg_h;
 
 #define CLR_BG     RGB(0x14, 0x1B, 0x24)
 #define CLR_FG     RGB(0xF2, 0xF5, 0xF8)
 #define CLR_WARN   RGB(0xF0, 0xA0, 0x20)
 #define CLR_HINT   RGB(0xAA, 0xB6, 0xC3)
+#define WIN_W      460
 
 static int px(int v) { return MulDiv(v, g_dpi, 96); }
+static int win_h(void) { return px(140) + g_msg_h + px(22); }
 
 static unsigned idle_ms(void) {
     LASTINPUTINFO li;
@@ -184,10 +286,10 @@ static void paint(HWND h) {
     }
     SetBkMode(dc, TRANSPARENT);
 
-    r = rc; r.top = px(20); r.bottom = px(52);
+    r = rc; r.top = px(18); r.bottom = px(52); r.left += px(16); r.right -= px(16);
     SelectObject(dc, g_font_title);
     SetTextColor(dc, CLR_FG);
-    DrawTextW(dc, L"No activity detected", -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(dc, g_conf.title, -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     r = rc; r.top = px(52); r.bottom = px(140);
     SelectObject(dc, g_font_num);
@@ -195,11 +297,10 @@ static void paint(HWND h) {
     wsprintfW(num, L"%u", g_secs);
     DrawTextW(dc, num, -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
-    r = rc; r.top = px(140); r.bottom = rc.bottom - px(14); r.left += px(20); r.right -= px(20);
+    r = rc; r.top = px(140); r.bottom = r.top + g_msg_h; r.left += px(20); r.right -= px(20);
     SelectObject(dc, g_font_hint);
     SetTextColor(dc, CLR_HINT);
-    DrawTextW(dc, L"This PC will shut down.\nMove the mouse or press any key to cancel.", -1, &r,
-              DT_CENTER | DT_WORDBREAK);
+    DrawTextW(dc, g_conf.message, -1, &r, DT_CENTER | DT_WORDBREAK);
 
     DeleteObject(bg);
     DeleteObject(border);
@@ -207,12 +308,10 @@ static void paint(HWND h) {
 }
 
 static void place_on_top(HWND h, UINT extra) {
-    int w = px(460), ht = px(210);
+    int w = px(WIN_W), ht = win_h();
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - ht) / 2;
     SetWindowPos(h, HWND_TOPMOST, x, y, w, ht, SWP_NOACTIVATE | extra);
 }
-
-static DWORD g_shown_at; /* tick count when the warning appeared */
 
 static void tick(HWND h) {
     unsigned idle = idle_ms(), secs = 0;
@@ -220,8 +319,8 @@ static void tick(HWND h) {
     as_action a = as_decide(&g_cfg, idle, shown, &secs);
 
     if (a == AS_SHUTDOWN) {
-        TLOG(L"helper: countdown finished (idle %u ms), asking the service to shut down", idle);
-        PostQuitMessage((int)AS_EXIT_SHUTDOWN);
+        TLOG(L"helper: countdown finished (idle %u ms), asking the service to %s", idle, as_power_name(g_conf.power));
+        PostQuitMessage((int)AS_EXIT_POWER);
         return;
     }
     if (a == AS_WARN) {
@@ -237,7 +336,7 @@ static void tick(HWND h) {
             g_secs = secs;
             InvalidateRect(h, NULL, FALSE);
             UpdateWindow(h);
-            if (as_should_beep(secs))
+            if (g_conf.beep && as_should_beep(secs))
                 Beep(secs <= 5 ? 1200 : 880, 120);
         }
     } else if (IsWindowVisible(h)) {
@@ -262,25 +361,32 @@ static int run_helper(void) {
     WNDCLASSW wc;
     MSG msg;
     HDC dc;
-    DWORD idle_min = saved_minutes();
-    DWORD warn_s = reg_get(L"WarnSeconds", AS_DEFAULT_WARN_SECONDS);
-    if (warn_s < 10 || warn_s > 600)
-        warn_s = AS_DEFAULT_WARN_SECONDS;
-    g_cfg.idle_ms = idle_min * 60u * 1000u;
-    g_cfg.warn_ms = warn_s * 1000u;
+    HWND wnd;
+    RECT r;
+
+    config_load(&g_conf);
+    g_cfg.idle_ms = g_conf.idle_minutes * 60u * 1000u;
+    g_cfg.warn_ms = g_conf.warn_seconds * 1000u;
 #ifdef AS_TEST_BUILD
-    { DWORD t = reg_get(L"TestIdleSeconds", 0); if (t >= 5) g_cfg.idle_ms = t * 1000u; }
-    TLOG(L"helper: started in session %lu, idle limit %u ms, warning %u ms, idle now %u ms",
-         WTSGetActiveConsoleSessionId(), g_cfg.idle_ms, g_cfg.warn_ms, idle_ms());
+    if (g_conf.test_idle_seconds)
+        g_cfg.idle_ms = g_conf.test_idle_seconds * 1000u;
+    TLOG(L"helper: started in session %lu, idle limit %u ms, warning %u ms, action %s, beep %d, idle now %u ms",
+         WTSGetActiveConsoleSessionId(), g_cfg.idle_ms, g_cfg.warn_ms, as_power_name(g_conf.power),
+         g_conf.beep, idle_ms());
 #endif
 
     SetProcessDPIAware();
     dc = GetDC(NULL);
     g_dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    ReleaseDC(NULL, dc);
     g_font_title = make_font(20, FW_SEMIBOLD);
     g_font_num = make_font(72, FW_BOLD);
     g_font_hint = make_font(14, FW_NORMAL);
+    /* window grows to fit a long custom message (capped so it stays on screen) */
+    SelectObject(dc, g_font_hint);
+    r.left = 0; r.top = 0; r.right = px(WIN_W - 40); r.bottom = 0;
+    DrawTextW(dc, g_conf.message, -1, &r, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+    g_msg_h = r.bottom < px(20) ? px(20) : r.bottom > px(300) ? px(300) : r.bottom;
+    ReleaseDC(NULL, dc);
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
@@ -288,12 +394,12 @@ static int run_helper(void) {
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"SuperliteAutoshutWarning";
     RegisterClassW(&wc);
-    g_wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
-                            L"Superlite Autoshut", WS_POPUP, 0, 0, px(460), px(210), NULL, NULL,
-                            wc.hInstance, NULL);
-    if (!g_wnd)
+    wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
+                          L"Superlite Autoshut", WS_POPUP, 0, 0, px(WIN_W), win_h(), NULL, NULL,
+                          wc.hInstance, NULL);
+    if (!wnd)
         return 1;
-    tick(g_wnd);
+    tick(wnd);
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
         DispatchMessageW(&msg);
     return (int)msg.wParam;
@@ -364,9 +470,9 @@ static HANDLE launch_helper(DWORD session) {
     return pi.hProcess;
 }
 
-static void shut_down_pc(void) {
+static void power_off(as_power p) {
 #ifdef AS_TEST_BUILD
-    TLOG(L"service: TEST BUILD - the real build would shut the PC down now");
+    TLOG(L"service: TEST BUILD - the real build would %s the PC now", as_power_name(p));
 #else
     HANDLE t;
     TOKEN_PRIVILEGES tp;
@@ -378,14 +484,29 @@ static void shut_down_pc(void) {
         }
         CloseHandle(t);
     }
-    InitiateSystemShutdownExW(NULL, NULL, 0, TRUE, FALSE,
+    /* Sleep/hibernate turned off on this PC? Shut down instead of staying on. */
+    if ((p == AS_POWER_SLEEP || p == AS_POWER_HIBERNATE) &&
+        SetSuspendState(p == AS_POWER_HIBERNATE, FALSE, FALSE))
+        return;
+    InitiateSystemShutdownExW(NULL, NULL, 0, TRUE, p == AS_POWER_RESTART,
                               SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
 #endif
 }
 
+static void kill_helper(HANDLE *helper) {
+    if (*helper) {
+        TerminateProcess(*helper, 0);
+        WaitForSingleObject(*helper, 2000);
+        CloseHandle(*helper);
+        *helper = NULL;
+    }
+}
+
 static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
-    HANDLE helper = NULL, waits[3];
-    DWORD helper_session = 0xFFFFFFFF, session, r, code;
+    HANDLE helper = NULL, watch, waits[4];
+    DWORD helper_session = 0xFFFFFFFF, session, r, code, n, w_watch, w_helper;
+    wchar_t dir[MAX_PATH];
+    config conf;
     (void)argc; (void)argv;
 
     g_ssh = RegisterServiceCtrlHandlerExW(SVC_NAME, svc_ctrl, NULL);
@@ -393,47 +514,63 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
         return;
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_session_changed = CreateEventW(NULL, FALSE, FALSE, NULL);
+    install_dir(dir);
+    watch = FindFirstChangeNotificationW(dir, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE |
+                                         FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE);
+    config_load(&conf);
     set_state(SERVICE_RUNNING);
-    TLOG(L"service: started, idle time %u min", saved_minutes());
+    TLOG(L"service: started, idle %u min, action %s, enabled %d", conf.idle_minutes,
+         as_power_name(conf.power), conf.enabled);
 
     for (;;) {
         session = WTSGetActiveConsoleSessionId();
-        if (helper && session != helper_session) { /* user switched / console moved */
-            TerminateProcess(helper, 0);
-            CloseHandle(helper);
-            helper = NULL;
-        }
-        if (!helper && session != 0xFFFFFFFF) {
+        if (helper && session != helper_session) /* user switched / console moved */
+            kill_helper(&helper);
+        if (!helper && conf.enabled && session != 0xFFFFFFFF) {
             helper = launch_helper(session);
             helper_session = session;
         }
-        waits[0] = g_stop;
-        waits[1] = g_session_changed;
-        waits[2] = helper;
-        /* No polling: sleep until a stop, a session change or the helper exits.
-           Without a helper, retry every 2 s. */
-        r = WaitForMultipleObjects(helper ? 3 : 2, waits, FALSE, helper ? INFINITE : 2000);
+        /* No polling: sleep until a stop, a session change, a config.ini
+           change or the helper exits. Without a helper (but enabled), retry every 2 s. */
+        n = 0;
+        waits[n++] = g_stop;
+        waits[n++] = g_session_changed;
+        w_watch = w_helper = 0xFFFFFFFF;
+        if (watch != INVALID_HANDLE_VALUE) { w_watch = n; waits[n++] = watch; }
+        if (helper) { w_helper = n; waits[n++] = helper; }
+        r = WaitForMultipleObjects(n, waits, FALSE, (helper || !conf.enabled) ? INFINITE : 2000);
         if (r == WAIT_OBJECT_0)
             break;
-        if (r == WAIT_OBJECT_0 + 2) {
+        if (r == WAIT_OBJECT_0 + w_watch) {
+            /* editors save in several steps: let them finish, then reload */
+            if (WaitForSingleObject(g_stop, 700) == WAIT_OBJECT_0)
+                break;
+            FindNextChangeNotification(watch);
+            config_load(&conf);
+            TLOG(L"service: config.ini changed: idle %u min, action %s, enabled %d", conf.idle_minutes,
+                 as_power_name(conf.power), conf.enabled);
+            kill_helper(&helper); /* restarted next loop with the new settings */
+        } else if (r == WAIT_OBJECT_0 + w_helper) {
             code = 0;
             GetExitCodeProcess(helper, &code);
             CloseHandle(helper);
             helper = NULL;
             TLOG(L"service: helper exited with code 0x%lX", code);
-            if (code == AS_EXIT_SHUTDOWN) {
-                shut_down_pc();
-                if (WaitForSingleObject(g_stop, 60000) == WAIT_OBJECT_0)
+            if (code == AS_EXIT_POWER) {
+                config_load(&conf);
+                power_off(conf.power);
+                /* shutdown/restart: Windows stops us soon. sleep: continue after wake. */
+                if (WaitForSingleObject(g_stop, (conf.power == AS_POWER_SLEEP || conf.power == AS_POWER_HIBERNATE)
+                                                    ? 5000 : 60000) == WAIT_OBJECT_0)
                     break;
             } else if (WaitForSingleObject(g_stop, 1000) == WAIT_OBJECT_0) {
                 break; /* killed by someone: restart it after 1 s */
             }
         }
     }
-    if (helper) {
-        TerminateProcess(helper, 0);
-        CloseHandle(helper);
-    }
+    kill_helper(&helper);
+    if (watch != INVALID_HANDLE_VALUE)
+        FindCloseChangeNotification(watch);
     TLOG(L"service: stopped");
     set_state(SERVICE_STOPPED);
 }
@@ -464,18 +601,37 @@ static void stop_service(SC_HANDLE s) {
     Sleep(300); /* let the helper exit so its exe is unlocked */
 }
 
+static void print_settings(void) {
+    config c;
+    wchar_t path[MAX_PATH];
+    install_file(path, INI_NAME);
+    config_load(&c);
+    outf(L"Settings:  %s\r\n", path);
+    outf(L"  Idle time   %u minute%s\r\n", c.idle_minutes, c.idle_minutes == 1 ? L"" : L"s");
+    outf(L"  Warning     %u seconds, beep %s\r\n", c.warn_seconds, c.beep ? L"on" : L"off");
+    outf(L"  Action      %s\r\n", as_power_name(c.power));
+    outf(L"  Enabled     %s\r\n", c.enabled ? L"yes" : L"no (paused)");
+#ifdef AS_TEST_BUILD
+    out(L"TEST BUILD: it never turns the PC off, it only logs to %ProgramData%\\Superlite Autoshut\\test.log\r\n");
+#endif
+}
+
 static int cmd_install(int argc, wchar_t **argv) {
-    unsigned minutes;
-    wchar_t self[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], bin[MAX_PATH + 16];
+    unsigned minutes = 0;
+    int have_minutes = 0;
+    wchar_t self[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], ini[MAX_PATH], bin[MAX_PATH + 16];
     SC_HANDLE m, s;
     SERVICE_DESCRIPTIONW desc;
     SERVICE_FAILURE_ACTIONSW fa;
     SC_ACTION acts[3];
+    int ok;
 
-    minutes = saved_minutes();
-    if (argc >= 3 && !as_parse_minutes(argv[2], &minutes)) {
-        out(L"The idle time must be a whole number of minutes from 1 to 1440.\r\n");
-        return 2;
+    if (argc >= 3) {
+        if (!as_parse_minutes(argv[2], &minutes)) {
+            out(L"The idle time must be a whole number of minutes from 1 to 1440.\r\n");
+            return 2;
+        }
+        have_minutes = 1;
     }
     if (!(m = open_scm()))
         return 5;
@@ -485,8 +641,9 @@ static int cmd_install(int argc, wchar_t **argv) {
         stop_service(s);
 
     GetModuleFileNameW(NULL, self, MAX_PATH);
-    install_dir(dir, MAX_PATH);
-    install_exe(target, MAX_PATH);
+    install_dir(dir);
+    install_file(target, EXE_NAME);
+    install_file(ini, INI_NAME);
     CreateDirectoryW(dir, NULL);
     if (lstrcmpiW(self, target) != 0 && !CopyFileW(self, target, FALSE)) {
         outf(L"Could not copy the program to %s (error %lu).\r\n", target, GetLastError());
@@ -494,12 +651,19 @@ static int cmd_install(int argc, wchar_t **argv) {
         CloseServiceHandle(m);
         return 1;
     }
-    if (!reg_set(L"IdleMinutes", minutes)) {
-        out(L"Could not save the idle time in the registry.\r\n");
+
+    /* Keep an existing config.ini; only change IdleMinutes when given. */
+    if (GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES)
+        ok = config_write_default(have_minutes ? minutes : old_registry_minutes());
+    else
+        ok = have_minutes ? config_set_minutes(minutes) : 1;
+    if (!ok) {
+        outf(L"Could not write %s.\r\n", ini);
         if (s) CloseServiceHandle(s);
         CloseServiceHandle(m);
         return 1;
     }
+    RegDeleteKeyExW(HKEY_LOCAL_MACHINE, OLD_REG_KEY, KEY_WOW64_64KEY, 0); /* moved to config.ini */
 
     wsprintfW(bin, L"\"%s\" service", target);
     if (s) {
@@ -514,7 +678,7 @@ static int cmd_install(int argc, wchar_t **argv) {
             return 1;
         }
     }
-    desc.lpDescription = L"Shuts this PC down when nobody uses the keyboard or mouse for the set time.";
+    desc.lpDescription = L"Shuts this PC down when nobody uses the keyboard or mouse for the set time. Settings: config.ini in its folder.";
     ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &desc);
     acts[0].Type = acts[1].Type = acts[2].Type = SC_ACTION_RESTART;
     acts[0].Delay = acts[1].Delay = 1000;
@@ -533,46 +697,29 @@ static int cmd_install(int argc, wchar_t **argv) {
     }
     CloseServiceHandle(s);
     CloseServiceHandle(m);
-    outf(L"Superlite Autoshut is installed and running.\r\n"
-         L"This PC shuts down after %u minute%s with no keyboard or mouse use.\r\n",
-         minutes, minutes == 1 ? L"" : L"s");
-#ifdef AS_TEST_BUILD
-    out(L"TEST BUILD: it never shuts down. It logs to %ProgramData%\\Superlite Autoshut\\test.log\r\n");
-#endif
+    out(L"Superlite Autoshut " AS_VERSION L" is installed and running.\r\n");
+    print_settings();
     return 0;
 }
 
 static int cmd_set(int argc, wchar_t **argv) {
     unsigned minutes;
-    SC_HANDLE m, s;
     if (argc < 3 || !as_parse_minutes(argv[2], &minutes)) {
         out(L"Usage: SuperliteAutoshut.exe set <minutes>   (1 to 1440)\r\n");
         return 2;
     }
-    if (!(m = open_scm()))
-        return 5;
-    s = OpenServiceW(m, SVC_NAME, SERVICE_ALL_ACCESS);
-    if (!s) {
-        out(L"Superlite Autoshut is not installed. Run: SuperliteAutoshut.exe install <minutes>\r\n");
-        CloseServiceHandle(m);
+    if (!config_set_minutes(minutes)) {
+        out(GetLastError() == ERROR_ACCESS_DENIED
+            ? L"Run this as administrator (right-click PowerShell > Run as administrator).\r\n"
+            : L"Could not save config.ini. Is Superlite Autoshut installed?\r\n");
         return 1;
     }
-    if (!reg_set(L"IdleMinutes", minutes)) {
-        out(L"Could not save the idle time in the registry.\r\n");
-        CloseServiceHandle(s);
-        CloseServiceHandle(m);
-        return 1;
-    }
-    stop_service(s); /* restart so the helper reads the new time */
-    StartServiceW(s, 0, NULL);
-    CloseServiceHandle(s);
-    CloseServiceHandle(m);
-    outf(L"Idle time set to %u minute%s.\r\n", minutes, minutes == 1 ? L"" : L"s");
+    outf(L"Idle time set to %u minute%s. It applies right away.\r\n", minutes, minutes == 1 ? L"" : L"s");
     return 0;
 }
 
 static int cmd_uninstall(void) {
-    wchar_t self[MAX_PATH], dir[MAX_PATH], target[MAX_PATH];
+    wchar_t self[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], ini[MAX_PATH];
     SC_HANDLE m, s;
     if (!(m = open_scm()))
         return 5;
@@ -583,14 +730,16 @@ static int cmd_uninstall(void) {
         CloseServiceHandle(s);
     }
     CloseServiceHandle(m);
-    RegDeleteKeyExW(HKEY_LOCAL_MACHINE, REG_KEY, KEY_WOW64_64KEY, 0);
+    RegDeleteKeyExW(HKEY_LOCAL_MACHINE, OLD_REG_KEY, KEY_WOW64_64KEY, 0);
 
     GetModuleFileNameW(NULL, self, MAX_PATH);
-    install_dir(dir, MAX_PATH);
-    install_exe(target, MAX_PATH);
+    install_dir(dir);
+    install_file(target, EXE_NAME);
+    install_file(ini, INI_NAME);
+    DeleteFileW(ini);
     if (lstrcmpiW(self, target) == 0) {
-        /* A running exe can't delete itself: a hidden cmd removes the folder
-           2 s after we exit. (Not "delete at reboot": a reinstall before the
+        /* A running exe can't delete itself: a hidden cmd removes it 2 s
+           after we exit. (Not "delete at reboot": a reinstall before the
            reboot would then lose its exe.) */
         wchar_t cmd[MAX_PATH * 2 + 96];
         STARTUPINFOW si;
@@ -619,11 +768,8 @@ static int cmd_status(void) {
               : st.dwCurrentState == SERVICE_STOPPED ? L"stopped" : L"starting or stopping";
     if (s) CloseServiceHandle(s);
     if (m) CloseServiceHandle(m);
-    outf(L"Superlite Autoshut " AS_VERSION L"\r\nService:   %s\r\nIdle time: %u minute%s\r\n",
-         state, saved_minutes(), saved_minutes() == 1 ? L"" : L"s");
-#ifdef AS_TEST_BUILD
-    out(L"TEST BUILD: it never shuts down, it only logs.\r\n");
-#endif
+    outf(L"Superlite Autoshut " AS_VERSION L"\r\nService:   %s\r\n", state);
+    print_settings();
     return 0;
 }
 
@@ -631,11 +777,13 @@ static int usage(void) {
     out(L"Superlite Autoshut " AS_VERSION L" - shuts the PC down when nobody uses it.\r\n\r\n"
         L"  SuperliteAutoshut.exe install [minutes]   install and start (default 10 minutes)\r\n"
         L"  SuperliteAutoshut.exe set <minutes>       change the idle time\r\n"
-        L"  SuperliteAutoshut.exe status              show the current state\r\n"
+        L"  SuperliteAutoshut.exe status              show the current settings\r\n"
         L"  SuperliteAutoshut.exe uninstall           remove it\r\n\r\n"
+        L"All settings are in config.ini next to the installed exe:\r\n"
+        L"  C:\\Program Files\\Superlite Autoshut\\config.ini\r\n"
         L"Install, set and uninstall need an administrator PowerShell or Command Prompt.\r\n");
 #ifdef AS_TEST_BUILD
-    out(L"\r\nTEST BUILD: it never shuts down, it only logs.\r\n");
+    out(L"\r\nTEST BUILD: it never turns the PC off, it only logs.\r\n");
 #endif
     return 0;
 }

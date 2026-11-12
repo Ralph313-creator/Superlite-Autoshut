@@ -25,7 +25,7 @@ if /i "%1"=="test" exit /b 0
 rem No C runtime: the exe only needs kernel32/user32/gdi32/advapi32/shell32/wtsapi32.
 set CFLAGS=/nologo /W4 /WX /O1 /Os /GS- /Gs999999 /Zl /DUNICODE /D_UNICODE
 set LFLAGS=/link /NODEFAULTLIB /ENTRY:entry /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF /MANIFEST:EMBED /MANIFESTUAC:level='asInvoker' ^
- kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib wtsapi32.lib
+ kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib powrprof.lib
 
 rc /nologo /fo obj\app.res src\app.rc || exit /b 1
 
